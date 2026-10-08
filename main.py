@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
-import tempfile
 import uuid
+import zipfile
 from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import geopandas as gpd
@@ -15,7 +16,6 @@ import pyogrio
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pyproj import CRS
-from shapely.geometry import mapping
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -23,6 +23,9 @@ DATA_DIR = Path(os.environ.get("GEOSPATIAL_DATA_DIR", APP_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "measurements.sqlite3"
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))
+MAX_FEATURES = int(os.environ.get("MAX_FEATURES", "25000"))
+MAX_ZIP_MEMBERS = int(os.environ.get("MAX_ZIP_MEMBERS", "10000"))
+MAX_ZIP_UNCOMPRESSED_BYTES = int(os.environ.get("MAX_ZIP_UNCOMPRESSED_BYTES", str(250 * 1024 * 1024)))
 CHUNK_SIZE = 1024 * 1024
 
 app = FastAPI(
@@ -77,7 +80,35 @@ def public_file(row: sqlite3.Row) -> dict[str, Any]:
 def read_geospatial_file(path: Path, suffix: str) -> gpd.GeoDataFrame:
     if suffix == ".zip":
         try:
+            with zipfile.ZipFile(path) as archive:
+                members = [item for item in archive.infolist() if not item.is_dir()]
+                if len(members) > MAX_ZIP_MEMBERS:
+                    raise ValueError(f"The ZIP archive has too many files (limit {MAX_ZIP_MEMBERS}).")
+                total_uncompressed = sum(item.file_size for item in members)
+                if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
+                    raise ValueError(
+                        "The ZIP archive expands beyond the "
+                        f"{MAX_ZIP_UNCOMPRESSED_BYTES}-byte uncompressed size limit."
+                    )
+                for item in members:
+                    member_path = PurePosixPath(item.filename.replace("\\", "/"))
+                    if (member_path.is_absolute() or ".." in member_path.parts
+                            or (member_path.parts and ":" in member_path.parts[0])):
+                        raise ValueError("The ZIP archive contains an unsafe file path.")
+                shapefiles = [item.filename for item in members if item.filename.lower().endswith(".shp")]
+                if not shapefiles:
+                    raise ValueError("The ZIP archive must contain a Shapefile (.shp).")
+                if len(shapefiles) > 1:
+                    raise ValueError("The ZIP archive must contain exactly one Shapefile (.shp).")
+                stem = shapefiles[0][:-4].casefold()
+                member_names = {item.filename.casefold() for item in members}
+                missing_sidecars = [extension for extension in (".shx", ".dbf")
+                                    if f"{stem}{extension}" not in member_names]
+                if missing_sidecars:
+                    raise ValueError("The Shapefile ZIP is missing required .shx or .dbf sidecar files.")
             layers = pyogrio.list_layers(path)
+        except ValueError:
+            raise
         except Exception as exc:
             raise ValueError("The ZIP could not be read as a Shapefile archive.") from exc
         if len(layers) == 0:
@@ -127,10 +158,25 @@ def axis_to_meters(crs: CRS) -> float:
 def serializable(value: Any) -> Any:
     if value is None:
         return None
+    if hasattr(value, "tolist"):
+        converted = value.tolist()
+        if converted is not value:
+            return serializable(converted)
     if hasattr(value, "item"):
-        value = value.item()
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, dict):
+        return {str(key): serializable(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [serializable(nested) for nested in value]
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
     return str(value)
 
 
@@ -138,12 +184,17 @@ def process_file(path: Path, suffix: str) -> tuple[list[dict[str, Any]], str, st
     try:
         frame = read_geospatial_file(path, suffix)
         frame = normalize_crs(frame, suffix)
+        if frame.empty:
+            raise ValueError("The uploaded file contains no features.")
         source_crs = CRS.from_user_input(frame.crs)
         measured, measurement_crs = choose_measurement_frame(frame)
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError(f"Could not process the geospatial file: {exc}") from exc
+
+    if len(frame) > MAX_FEATURES:
+        raise ValueError(f"The file contains {len(frame)} features; the limit is {MAX_FEATURES}.")
 
     factor = axis_to_meters(measurement_crs)
     features: list[dict[str, Any]] = []
@@ -154,16 +205,24 @@ def process_file(path: Path, suffix: str) -> tuple[list[dict[str, Any]], str, st
         feature: dict[str, Any] = {
             "feature_index": index,
             "geometry_type": geom_type,
-            "geometry": geometry,
+            "geometry": serializable(geometry),
             "crs": source_crs.to_string(),
             "properties": {key: serializable(value) for key, value in source_row.get("properties", {}).items()},
             "measurement": None,
         }
         if shapely_geometry is not None and not shapely_geometry.is_empty:
             if geom_type in {"Polygon", "MultiPolygon"}:
-                feature["measurement"] = {"area_m2": float(shapely_geometry.area * factor**2)}
+                area = float(shapely_geometry.area * factor**2)
+                if math.isfinite(area):
+                    feature["measurement"] = {"area_m2": area}
+                else:
+                    feature["measurement_note"] = "Area could not be represented as a finite value."
             elif geom_type in {"LineString", "MultiLineString", "LinearRing"}:
-                feature["measurement"] = {"length_m": float(shapely_geometry.length * factor)}
+                length = float(shapely_geometry.length * factor)
+                if math.isfinite(length):
+                    feature["measurement"] = {"length_m": length}
+                else:
+                    feature["measurement_note"] = "Length could not be represented as a finite value."
             elif geom_type in {"Point", "MultiPoint"}:
                 feature["measurement"] = None
             else:
@@ -182,7 +241,7 @@ def health() -> dict[str, str]:
 
 @app.post("/api/files/", status_code=201)
 async def upload_file(file: UploadFile = File(...)) -> JSONResponse:
-    filename = Path(file.filename or "upload").name
+    filename = PurePosixPath((file.filename or "upload").replace("\\", "/")).name
     suffix = Path(filename).suffix.lower()
     if suffix not in {".zip", ".kml"}:
         raise HTTPException(status_code=415, detail="Supported uploads are .zip Shapefile archives and .kml files.")
