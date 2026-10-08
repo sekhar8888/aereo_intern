@@ -1,40 +1,72 @@
-# Backend Assignment Projects
+# Geospatial File Measurement API
 
-This repository contains two standalone Python API projects. Each folder has its own dependencies, setup instructions, API examples, and design notes.
+A FastAPI service that accepts KML, GeoJSON, and Shapefile uploads, stores file metadata in SQLite, and returns geometry measurements in meters. This repository also contains the separate `bulk_certificate` assignment; each API has its own dependencies.
 
-## Projects
+## Geospatial API: run on Windows
 
-### Geospatial File Measurement API
+Open PowerShell in the repository root (the folder containing `main.py`) and run:
 
-[`/`](.) contains a FastAPI service for `.kml` uploads and zipped Shapefiles. It returns feature geometry and attributes, calculates polygon area and line length in metric units, handles unsupported geometry types, and stores results in SQLite.
+```powershell
+py -m venv .venv
+.\\.venv\\Scripts\\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload
+```
 
-- Setup and endpoint guide: [README](README.md)
-- Tests: `tests/`
-- Run locally: `python -m pip install -r requirements.txt` followed by `uvicorn main:app --reload`
-- Run tests: install `requirements-dev.txt`, then run `python -m pytest -q`
+If PowerShell blocks virtual environment activation, run this once in that PowerShell window, then activate again:
 
-### Bulk Certificate Generator API
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
 
-[`bulk_certificate/`](bulk_certificate/) contains a separate FastAPI service that validates bulk recipient requests, tracks per-recipient outcomes in SQLite, generates PDF certificates, and serves each completed certificate for download.
+The service runs at `http://127.0.0.1:8000`. Open `http://127.0.0.1:8000/docs` for interactive API documentation, or `http://127.0.0.1:8000/health` for the health check. The SQLite database and uploaded-file storage are created under `data/` when the app runs.
 
-- Setup, request examples, and design notes: [bulk_certificate/README.md](bulk_certificate/README.md)
-- Run locally from that folder: `python -m pip install -r requirements.txt` followed by `uvicorn main:app --reload`
-- Run its tests from that folder: `pytest`
+### Run on macOS or Linux
 
-## Geospatial API design notes
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload
+```
 
-The geospatial service keeps returned geometry in the source CRS and transforms geographic inputs to a projected CRS for planar measurements. It estimates a local UTM CRS and reports the chosen CRS in each file response. Lengths and areas are converted to meters and square meters, including when projected source coordinates use feet.
+## Try the included sample KML
 
-The upload endpoint limits file size, ZIP member count, archive expansion size, and feature count. Shapefile archives must contain exactly one `.shp` plus matching `.shx` and `.dbf` sidecars; a `.prj` file should be included so the CRS can be identified. Archive paths are checked, uploads are assigned generated storage names, and non-finite attribute values are represented as JSON `null`.
+With the server running, open a second terminal in the repository root and upload the included file. It contains a polygon, a route, and a point around Bengaluru:
 
-Defaults can be adjusted with `MAX_UPLOAD_BYTES` (50 MiB), `MAX_FEATURES` (25,000), `MAX_ZIP_MEMBERS` (10,000), and `MAX_ZIP_UNCOMPRESSED_BYTES` (250 MiB). `GEOSPATIAL_DATA_DIR` changes where uploaded files and the SQLite database are stored.
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/api/files/ -F "file=@examples/measurement_sample.kml"
+```
 
-UTM is suitable for local data and can be inaccurate for datasets spanning large regions or multiple zones. The service reports its measurement CRS so clients can assess the result. Processing is synchronous and uses SQLite/local disk, which keeps local setup simple; larger deployments would benefit from background workers, pagination, object storage, and a production database.
+The response includes an `id`. Use that value to retrieve the parsed features and measurements (replace `<FILE_ID>` with the returned id):
 
-## Automated checks
+```powershell
+curl.exe http://127.0.0.1:8000/api/files/<FILE_ID>/measurements/
+```
 
-Install the test dependencies with `python -m pip install -r requirements-dev.txt`, then run `python -m pytest -q`. The suite exercises KML and zipped Shapefile uploads, measurement and CRS behavior, point and unsupported geometry handling, error responses, archive/file limits, and JSON-safe attributes. The GitHub Actions workflow runs these checks on relevant pushes and pull requests.
+The API reports polygon area as `area_m2` and line length as `length_m`. Point features are returned without an area or length measurement. You can also upload your own supported file by replacing the sample path, for example `-F "file=@C:\\path\\to\\your-file.kml"`.
 
-## Local data
+## Dependencies: why there are two requirements files
 
-Uploaded geospatial files, generated certificate PDFs, SQLite databases, virtual environments, and sample input files are excluded through `.gitignore` rules and should not be committed.
+There are two independent applications in this repository, so each has its own runtime dependency list:
+
+- Root [`requirements.txt`](requirements.txt): runtime packages for the geospatial measurement API in `main.py`.
+- [`bulk_certificate/requirements.txt`](bulk_certificate/requirements.txt): runtime packages for the certificate generator in the `bulk_certificate/` folder. Install this file when running that app from its folder.
+- Root [`requirements-dev.txt`](requirements-dev.txt): includes the geospatial runtime dependencies plus development/test tools such as pytest and httpx. Use it when you want to run the geospatial project's tests.
+
+Do not install both app requirement files into one environment unless you specifically need both applications in that environment. For the certificate API's own setup instructions, see [`bulk_certificate/README.md`](bulk_certificate/README.md).
+
+## Geospatial tests
+
+From the repository root, install development dependencies and run:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q tests/
+```
+
+## Measurement and format notes
+
+The source CRS is retained in API results. Measurements use a projected CRS in meters; for geographic source data, the service selects a UTM zone based on the input geometry. Measurements are planar, and the selected UTM CRS is most appropriate for local/regional datasets. Shapefiles should be uploaded as a ZIP containing the required companion files (`.shp`, `.shx`, and `.dbf`, with `.prj` recommended).
