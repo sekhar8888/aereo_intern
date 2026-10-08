@@ -8,7 +8,7 @@ Open PowerShell in the repository root (the folder containing `main.py`) and run
 
 ```powershell
 py -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m uvicorn main:app --reload
@@ -46,7 +46,7 @@ The response includes an `id`. Use that value to retrieve the parsed features an
 curl.exe http://127.0.0.1:8000/api/files/<FILE_ID>/measurements/
 ```
 
-The API reports polygon area as `area_m2` and line length as `length_m`. Point features are returned without an area or length measurement. You can also upload your own supported file by replacing the sample path, for example `-F "file=@C:\\path\\to\\your-file.kml"`.
+The API reports polygon area as `area_m2` and line length as `length_m`. Point features are returned without an area or length measurement. You can also upload your own supported file by replacing the sample path, for example `-F "file=@C:\path\to\your-file.kml"`.
 
 ## Dependencies: why there are two requirements files
 
